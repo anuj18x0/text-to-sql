@@ -19,6 +19,10 @@
 9. [🚀 Quick Start](#9-quick-start)
 10. [⚙️ Environment Variables](#10-environment-variables)
 
+
+
+SPECIAL THANKS : techwithpratik
+
 ---
 
 ## 1. 🤔 What Does This Project Do?
