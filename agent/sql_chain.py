@@ -570,7 +570,7 @@ async def run_query(question: str, history: list[dict[str, str]] = []) -> dict[s
             "latency_ms": overall_latency,
             "timing": timing,
             # "visualization": viz_suggestion  # Re-enable when using Flash model
-``        }
+        }
 
         # Save to Cache (1 hour expiration)
         _response_cache[normalized_q] = {
