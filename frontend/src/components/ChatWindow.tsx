@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { postQueryStream, type QueryResponse } from '../api'
 import SqlDisplay from './SqlDisplay'
 import ResultsTable from './ResultsTable'
+import ChartDisplay from './ChartDisplay'
 import SkeletonLoader from './SkeletonLoader'
 import type { Message } from '../App'
 
@@ -175,16 +176,25 @@ export default function ChatWindow({ messages, setMessages, onAnswer }: Props) {
                 {(msg.content as QueryResponse).sql === '' ? (
                   <SkeletonLoader />
                 ) : (
-                  <>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                     <SqlDisplay 
                       sql={(msg.content as QueryResponse).sql} 
                       timing={(msg.content as QueryResponse).timing}
                       latencyMs={(msg.content as QueryResponse).latency_ms}
                     />
+                    
+                    {(msg.content as QueryResponse).visualization && 
+                     (msg.content as QueryResponse).visualization?.type !== 'none' && (
+                      <ChartDisplay 
+                        {...(msg.content as QueryResponse).visualization!}
+                        data={(msg.content as QueryResponse).results}
+                      />
+                    )}
+
                     {(msg.content as QueryResponse).results.length > 0 && (
                       <ResultsTable results={(msg.content as QueryResponse).results} />
                     )}
-                  </>
+                  </div>
                 )}
               </div>
             )}

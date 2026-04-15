@@ -10,17 +10,17 @@ examples:
 
   - question: "How many orders were placed each month in 2018?"
     sql: |
-      SELECT strftime('%Y-%m', created_at) AS month, COUNT(DISTINCT order_id) AS order_count
-      FROM fact_orders
-      WHERE strftime('%Y', created_at) = '2018'
-      GROUP BY month
+      SELECT TO_CHAR(fo.created_at, 'YYYY-MM') AS month, COUNT(DISTINCT fo.order_id) AS order_count
+      FROM fact_orders fo
+      WHERE EXTRACT(YEAR FROM fo.created_at) = 2018
+      GROUP BY TO_CHAR(fo.created_at, 'YYYY-MM')
       ORDER BY month ASC
 
   - question: "Which states have the most active customers?"
     sql: |
       SELECT du.state, COUNT(DISTINCT du.user_id) AS active_customers
       FROM dim_users du
-      WHERE du.is_active_member = 1
+      WHERE du.is_active_member = true
       GROUP BY du.state
       ORDER BY active_customers DESC
       LIMIT 10
@@ -28,7 +28,7 @@ examples:
   - question: "What is the average review score per product category?"
     sql: |
       SELECT dp.category_name,
-             ROUND(AVG(dr.review_score), 2) AS avg_review_score,
+             ROUND(AVG(dr.review_score)::numeric, 2) AS avg_review_score,
              COUNT(dr.review_id) AS review_count
       FROM fact_orders fo
       JOIN dim_products dp ON fo.product_id = dp.product_id
@@ -64,13 +64,13 @@ examples:
     sql: |
       SELECT dp.category_name,
              dp.product_id,
-             ROUND(AVG(fo.freight_value_usd), 2) AS avg_freight,
-             ROUND(AVG(fo.order_total_usd), 2) AS avg_order_value,
-             ROUND(AVG(fo.freight_value_usd) / NULLIF(AVG(fo.order_total_usd), 0) * 100, 2) AS freight_pct
+             ROUND(AVG(fo.freight_value_usd)::numeric, 2) AS avg_freight,
+             ROUND(AVG(fo.order_total_usd)::numeric, 2) AS avg_order_value,
+             ROUND((AVG(fo.freight_value_usd) / NULLIF(AVG(fo.order_total_usd), 0) * 100)::numeric, 2) AS freight_pct
       FROM fact_orders fo
       JOIN dim_products dp ON fo.product_id = dp.product_id
       GROUP BY dp.product_id, dp.category_name
-      HAVING avg_order_value > 0
+      HAVING AVG(fo.order_total_usd) > 0
       ORDER BY freight_pct DESC
       LIMIT 20
 
@@ -80,12 +80,12 @@ examples:
              du.city,
              du.state,
              COUNT(DISTINCT fo.order_id) AS order_count,
-             ROUND(SUM(fo.order_total_usd), 2) AS total_spend
+             ROUND(SUM(fo.order_total_usd)::numeric, 2) AS total_spend
       FROM fact_orders fo
       JOIN dim_users du ON fo.user_id = du.user_id
       WHERE fo.order_status = 'delivered'
       GROUP BY fo.user_id, du.city, du.state
-      HAVING order_count > 3
+      HAVING COUNT(DISTINCT fo.order_id) > 3
       ORDER BY total_spend DESC
 
   - question: "Who are the best sellers among the product category?"

@@ -10,6 +10,12 @@ export interface QueryResponse {
   approval_reason?: string
   latency_ms: number
   timing: Record<string, number>
+  visualization?: {
+    type: 'bar' | 'line' | 'pie' | 'none'
+    x: string
+    y: string
+    title: string
+  }
 }
 
 export interface ApproveResponse {

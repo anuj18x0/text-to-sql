@@ -55,7 +55,6 @@ def get_relevant_schema(query: str, k: int = 3) -> str:
         results = collection.query(query_texts=[query], n_results=k)
         
         documents: list[str] = results["documents"][0] if results["documents"] else []  # type: ignore[index]
-        logger.debug("Retrieved %d schema snippets for query: %s", len(documents), query)
         return "\n\n---\n\n".join(documents)
     except Exception as exc:
         logger.warning("Schema retrieval failed: %s — falling back to empty context.", exc)

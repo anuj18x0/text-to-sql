@@ -46,20 +46,22 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # Module-level caches
-_llm: ChatGoogleGenerativeAI | None = None
+_llm_sql: ChatGoogleGenerativeAI | None = None
+_llm_fast: ChatGoogleGenerativeAI | None = None
 _cached_examples: str | None = None
 _response_cache: dict[str, dict[str, Any]] = {}  # {normalized_question: {"response": dict, "expires_at": float}}
 
 
-def _get_llm() -> ChatGoogleGenerativeAI:
-    global _llm
-    if _llm is None:
-        _llm = ChatGoogleGenerativeAI(
+def _get_llm(temperature: float = 0) -> ChatGoogleGenerativeAI:
+    """Return a cached LLM instance. Uses module-level singleton."""
+    global _llm_sql
+    if _llm_sql is None:
+        _llm_sql = ChatGoogleGenerativeAI(
             model=os.getenv("GEMINI_MODEL"),
-            temperature=0,
+            temperature=temperature,
             api_key=os.getenv("GEMINI_API_KEY", ""),
         )
-    return _llm
+    return _llm_sql
 
 
 def json_serializable(obj):
@@ -70,6 +72,71 @@ def json_serializable(obj):
         return obj.isoformat()
     raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
+
+VISUALIZATION_PROMPT = """You are a data visualization expert. Analyze the SQL query and the user's question to suggest the best way to visualize the data. 
+Available types: 'bar', 'line', 'pie', 'none'.
+
+Rules:
+1. 'line' is for time-series (dates/months).
+2. 'bar' is for comparing categories or numerical values.
+3. 'pie' is for parts-of-a-whole (only if categories < 10).
+4. 'none' if the result is just a single number, a long list of text, or not suitable for charts.
+
+Question: {question}
+SQL: {sql}
+
+Return valid JSON ONLY:
+{{
+  "type": "bar" | "line" | "pie" | "none",
+  "x": "column_name_to_use_for_x_axis",
+  "y": "column_name_to_use_for_y_axis",
+  "title": "A short descriptive title"
+}}"""
+
+async def _suggest_visualization(question: str, sql: str) -> dict[str, Any]:
+    """Uses LLM to suggest the best chart type for the given query."""
+    try:
+        llm = _get_llm(temperature=0)
+        prompt = ChatPromptTemplate.from_template(VISUALIZATION_PROMPT)
+        chain = prompt | llm | StrOutputParser()
+        
+        response = await chain.ainvoke({"question": question, "sql": sql})
+        # Extract JSON if LLM returned it in markdown blocks
+        json_str = re.sub(r"```json\n?|\n?```", "", response).strip()
+        data = json.loads(json_str)
+        return data
+    except Exception as e:
+        logger.warning("Failed to suggest visualization: %s", e)
+        return {"type": "none"}
+
+
+QUERY_EXPANSION_PROMPT = """You are a SQL data assistant. Transform the user's conversational question into a detailed, technical search query focused on database entities (tables/columns) and metrics. 
+
+Rules:
+1. If the question is already specific, keep it mostly as is.
+2. If the question is vague (e.g., 'How is business?'), expand it to include key metrics like total revenue, order count, and customer satisfaction.
+3. Use the conversation history to resolve pronouns or context.
+
+History: {history}
+Question: {question}
+
+Expanded Query:"""
+
+async def _expand_query(question: str, history: list[HumanMessage | AIMessage]) -> str:
+    """Uses LLM to turn conversational questions into descriptive search queries for RAG."""
+    try:
+        llm = _get_llm(temperature=0)
+        prompt = ChatPromptTemplate.from_template(QUERY_EXPANSION_PROMPT)
+        chain = prompt | llm | StrOutputParser()
+        
+        # Format history for expansion prompt
+        history_str = "\n".join([f"{msg.__class__.__name__}: {msg.content}" for msg in history[-3:]])
+        expanded = await chain.ainvoke({"question": question, "history": history_str})
+        logger.info("Expanded query: '%s' -> '%s'", question, expanded)
+        return expanded
+    except Exception as e:
+        logger.warning("Query expansion failed: %s", e)
+        return question
 
 async def stream_query(question: str, history: list[dict[str, str]] = []):
     """
@@ -95,7 +162,17 @@ async def stream_query(question: str, history: list[dict[str, str]] = []):
     generated_sql_chunks = []
     
     try:
-        # 2. Retrieval Start
+        # --- QUERY EXPANSION (commented out for latency — saves ~3-4s) ---
+        # yield f"data: {json.dumps({'event': 'status', 'data': 'Interpreting question...'}, default=json_serializable)}\n\n"
+        # expansion_start = time.monotonic()
+        # formatted_history = []
+        # for turn in history:
+        #     formatted_history.append(HumanMessage(content=turn["question"]))
+        #     formatted_history.append(AIMessage(content=turn["sql"]))
+        # expanded_q = await _expand_query(question, formatted_history)
+        # --- END QUERY EXPANSION ---
+        
+        # 2. Retrieval (using raw question directly)
         yield f"data: {json.dumps({'event': 'status', 'data': 'Analyzing database schema...'}, default=json_serializable)}\n\n"
         retrieval_start = time.monotonic()
         schema_context = get_relevant_schema(question, k=3)
@@ -167,13 +244,18 @@ async def stream_query(question: str, history: list[dict[str, str]] = []):
         overall_latency = int((time.monotonic() - overall_start) * 1000)
         _log_query(question, generated_sql, overall_latency, tables_used, error=None)
         
+        # --- VISUALIZATION SUGGESTION (commented out for latency — saves ~3-4s) ---
+        # viz_suggestion = await _suggest_visualization(question, generated_sql)
+        # --- END VISUALIZATION ---
+        
         final_response = {
             "sql": generated_sql,
             "results": results,
             "tables_used": tables_used,
             "requires_approval": False,
             "latency_ms": overall_latency,
-            "timing": timing
+            "timing": timing,
+            # "visualization": viz_suggestion  # Re-enable when using Flash model
         }
         
         # Save to Cache
@@ -395,6 +477,14 @@ async def run_query(question: str, history: list[dict[str, str]] = []) -> dict[s
     }
 
     try:
+        # --- QUERY EXPANSION (commented out for latency — saves ~3-4s) ---
+        # formatted_history = []
+        # for turn in history:
+        #     formatted_history.append(HumanMessage(content=turn["question"]))
+        #     formatted_history.append(AIMessage(content=turn["sql"]))
+        # expanded_q = await _expand_query(question, formatted_history)
+        # --- END QUERY EXPANSION ---
+
         # Step 1: Retrieve relevant schema snippets via RAG
         retrieval_start = time.monotonic()
         schema_context = get_relevant_schema(question, k=3)
@@ -468,14 +558,19 @@ async def run_query(question: str, history: list[dict[str, str]] = []) -> dict[s
         c_tokens = usage.get("output_tokens", 0)
         _update_token_log(p_tokens, c_tokens)
 
+        # --- VISUALIZATION SUGGESTION (commented out for latency — saves ~3-4s) ---
+        # viz_suggestion = await _suggest_visualization(question, generated_sql)
+        # --- END VISUALIZATION ---
+
         final_response = {
             "sql": generated_sql,
             "results": results,
             "tables_used": tables_used,
             "requires_approval": False,
             "latency_ms": overall_latency,
-            "timing": timing
-        }
+            "timing": timing,
+            # "visualization": viz_suggestion  # Re-enable when using Flash model
+``        }
 
         # Save to Cache (1 hour expiration)
         _response_cache[normalized_q] = {
