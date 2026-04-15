@@ -10,15 +10,15 @@
 
 1. [🤔 What Does This Project Do?](#1-what-does-this-project-do)
 2. [😬 The Problem With "Typical" Text-to-SQL](#2-the-problem-with-typical-text-to-sql)
-3. [🚀 Key Features](#2-key-features)
-4. [🏗️ Architecture](#3-architecture)
-5. [🔄 How a Query Works (Pipeline)](#4-how-a-query-works-pipeline)
-6. [🛠️ Core Techniques](#5-core-techniques)
-7. [✅ What It Can (and Cannot) Do](#6-what-it-can-and-cannot-do)
-8. [📁 Project Structure](#7-project-structure)
-9. [🗄️ Database Schema](#8-database-schema)
-10. [🚀 Quick Start](#9-quick-start)
-11. [⚙️ Environment Variables](#10-environment-variables)
+3. [🚀 Key Features](#3-key-features)
+4. [🏗️ Architecture](#4-architecture)
+5. [🔄 How a Query Works (Pipeline)](#5-how-a-query-works-pipeline)
+6. [🛠️ Core Techniques](#6-core-techniques)
+7. [✅ What It Can (and Cannot) Do](#7-what-it-can-and-cannot-do)
+8. [📁 Project Structure](#8-project-structure)
+9. [🗄️ Database Schema](#9-database-schema)
+10. [🚀 Quick Start](#10-quick-start)
+11. [⚙️ Environment Variables](#11-environment-variables)
 
 SPECIAL THANKS : techwithpratik
 
