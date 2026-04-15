@@ -235,10 +235,39 @@ async def stream_query(question: str, history: list[dict[str, str]] = []):
             yield f"data: {json.dumps({'event': 'final_result', 'data': final_resp}, default=json_serializable)}\n\n"
             return
             
-        # 5. Execution
+        # 5. Execution with Self-Healing Retry Loop
         yield f"data: {json.dumps({'event': 'status', 'data': 'Executing query...'}, default=json_serializable)}\n\n"
         execution_start = time.monotonic()
-        results = await asyncio.to_thread(_execute_sql, generated_sql)
+        
+        current_sql = generated_sql
+        last_error = None
+        results = None
+        
+        for attempt in range(1 + MAX_RETRIES):
+            try:
+                results = await asyncio.to_thread(_execute_sql, current_sql)
+                generated_sql = current_sql  # Update to the working version
+                break
+            except Exception as exec_err:
+                last_error = str(exec_err)
+                if attempt < MAX_RETRIES:
+                    logger.warning(
+                        "SQL execution failed (attempt %d/%d): %s",
+                        attempt + 1, MAX_RETRIES + 1, last_error
+                    )
+                    yield f"data: {json.dumps({'event': 'status', 'data': f'Fixing SQL (attempt {attempt + 2})...'}, default=json_serializable)}\n\n"
+                    
+                    # Ask Gemini to fix the broken SQL
+                    fixed_sql = await _fix_sql(question, current_sql, last_error, schema_context)
+                    logger.info("Self-healed SQL: %s", fixed_sql)
+                    
+                    # Stream the corrected SQL to frontend
+                    yield f"data: {json.dumps({'event': 'sql_fix', 'data': fixed_sql}, default=json_serializable)}\n\n"
+                    current_sql = fixed_sql
+                else:
+                    # All retries exhausted — raise the last error
+                    raise exec_err
+        
         timing["execution_ms"] = int((time.monotonic() - execution_start) * 1000)
         
         overall_latency = int((time.monotonic() - overall_start) * 1000)
@@ -293,6 +322,35 @@ Rules:
 """
 
 USER_PROMPT = "Question: {question}\n\nSQL:"
+
+SQL_FIX_PROMPT = """You are an expert PostgreSQL debugger. The following SQL query failed with an error.
+Fix the query so it runs correctly. Output ONLY the corrected SQL — no explanation.
+
+Original Question: {question}
+Failed SQL: {sql}
+Error: {error}
+
+--- RELEVANT SCHEMA ---
+{schema}
+
+Corrected SQL:"""
+
+MAX_RETRIES = 2  # Maximum number of self-healing attempts
+
+
+async def _fix_sql(question: str, failed_sql: str, error: str, schema_context: str) -> str:
+    """Ask the LLM to fix a broken SQL query using the error message."""
+    llm = _get_llm()
+    prompt = ChatPromptTemplate.from_template(SQL_FIX_PROMPT)
+    chain = prompt | llm | StrOutputParser()
+    
+    response = await chain.ainvoke({
+        "question": question,
+        "sql": failed_sql,
+        "error": error,
+        "schema": schema_context,
+    })
+    return _extract_sql(response)
 
 
 def _load_few_shot_examples() -> str:
@@ -438,151 +496,3 @@ def _update_token_log(prompt_tokens: int, completion_tokens: int):
         f.write(f"input_tokens={total_input}\n")
         f.write(f"output_tokens={total_output}\n")
 
-
-
-
-
-async def run_query(question: str, history: list[dict[str, str]] = []) -> dict[str, Any]:
-    """
-    Full LCEL pipeline: natural-language question → SQL → executed results.
-    Includes a 1-hour local semantic cache and multi-turn context support.
-
-    Args:
-        question: User's natural language question.
-        history: List of previous interaction turns: [{"question": str, "sql": str}, ...]
-    """
-    overall_start = time.monotonic()
-    
-    # Cache Check (Include history in the key to ensure contextual variations are separate)
-    history_str = str(history)
-    normalized_q = f"{question.strip().lower()}|{history_str}"
-    if normalized_q in _response_cache:
-        cached = _response_cache[normalized_q]
-        if time.monotonic() < cached["expires_at"]:
-            logger.info("Serving cached response for: %s", normalized_q)
-            resp = cached["response"].copy()
-            resp["latency_ms"] = int((time.monotonic() - overall_start) * 1000)
-            resp["timing"] = {"retrieval_ms": 0, "llm_ms": 0, "execution_ms": 0}
-            return resp
-        else:
-            del _response_cache[normalized_q]
-
-    generated_sql = ""
-    tables_used: list[str] = []
-    error_msg: str | None = None
-    timing = {
-        "retrieval_ms": 0,
-        "llm_ms": 0,
-        "execution_ms": 0
-    }
-
-    try:
-        # --- QUERY EXPANSION (commented out for latency — saves ~3-4s) ---
-        # formatted_history = []
-        # for turn in history:
-        #     formatted_history.append(HumanMessage(content=turn["question"]))
-        #     formatted_history.append(AIMessage(content=turn["sql"]))
-        # expanded_q = await _expand_query(question, formatted_history)
-        # --- END QUERY EXPANSION ---
-
-        # Step 1: Retrieve relevant schema snippets via RAG
-        retrieval_start = time.monotonic()
-        schema_context = get_relevant_schema(question, k=3)
-        timing["retrieval_ms"] = int((time.monotonic() - retrieval_start) * 1000)
-
-        # Step 2: Load few-shot examples
-        few_shot = _load_few_shot_examples()
-
-        # Step 3: Build prompt with History
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", SYSTEM_PROMPT),
-                MessagesPlaceholder(variable_name="history"),
-                ("human", USER_PROMPT),
-            ]
-        )
-
-        # Step 4: Format History into ChatMessages
-        formatted_history = []
-        for turn in history:
-            formatted_history.append(HumanMessage(content=turn["question"]))
-            formatted_history.append(AIMessage(content=turn["sql"]))
-
-        # Step 5: Get LLM and invoke
-        llm = _get_llm()
-        chain = prompt | llm
-
-        llm_start = time.monotonic()
-        response = await chain.ainvoke(
-            {
-                "schema": schema_context,
-                "examples": few_shot,
-                "history": formatted_history,
-                "question": question,
-            }
-        )
-        timing["llm_ms"] = int((time.monotonic() - llm_start) * 1000)
-
-        generated_sql = _extract_sql(response.content)
-        tables_used = _extract_table_names(generated_sql)
-
-        # Step 6: HITL safety check
-        guard_result = check_sql(generated_sql)
-        current_latency = int((time.monotonic() - overall_start) * 1000)
-
-        if guard_result["requires_approval"]:
-            _log_query(question, generated_sql, current_latency, tables_used, error=None)
-            return {
-                "sql": generated_sql,
-                "results": [],
-                "tables_used": tables_used,
-                "requires_approval": True,
-                "approval_reason": guard_result.get("reason", ""),
-                "latency_ms": current_latency,
-                "timing": timing
-            }
-
-        # Step 7: Execute the SQL
-        execution_start = time.monotonic()
-        results = await asyncio.to_thread(_execute_sql, generated_sql)
-        timing["execution_ms"] = int((time.monotonic() - execution_start) * 1000)
-
-        overall_latency = int((time.monotonic() - overall_start) * 1000)
-
-        # Step 8: Log to query_log
-        _log_query(question, generated_sql, overall_latency, tables_used, error=None)
-        
-        # Extract token usage
-        usage = response.usage_metadata or {}
-        p_tokens = usage.get("input_tokens", 0)
-        c_tokens = usage.get("output_tokens", 0)
-        _update_token_log(p_tokens, c_tokens)
-
-        # --- VISUALIZATION SUGGESTION (commented out for latency — saves ~3-4s) ---
-        # viz_suggestion = await _suggest_visualization(question, generated_sql)
-        # --- END VISUALIZATION ---
-
-        final_response = {
-            "sql": generated_sql,
-            "results": results,
-            "tables_used": tables_used,
-            "requires_approval": False,
-            "latency_ms": overall_latency,
-            "timing": timing,
-            # "visualization": viz_suggestion  # Re-enable when using Flash model
-        }
-
-        # Save to Cache (1 hour expiration)
-        _response_cache[normalized_q] = {
-            "response": final_response,
-            "expires_at": time.monotonic() + 3600
-        }
-
-        return final_response
-
-    except Exception as exc:
-        overall_latency = int((time.monotonic() - overall_start) * 1000)
-        error_msg = str(exc)
-        logger.error("run_query failed: %s", exc, exc_info=True)
-        _log_query(question, generated_sql, overall_latency, tables_used, error=error_msg)
-        raise

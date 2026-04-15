@@ -35,10 +35,7 @@ export interface SchemaTable {
   columns: SchemaColumn[]
 }
 
-export async function postQuery(question: string, history: {question: string, sql: string}[] = []): Promise<QueryResponse> {
-  const { data } = await api.post<QueryResponse>('/api/query', { question, history })
-  return data
-}
+
 
 export async function postQueryStream(question: string, history: {question: string, sql: string}[] = []): Promise<ReadableStream<Uint8Array>> {
   const response = await fetch('/api/query/stream', {

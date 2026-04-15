@@ -91,6 +91,13 @@ export default function ChatWindow({ messages, setMessages, onAnswer }: Props) {
                   ? { ...m, content: { ...m.content as QueryResponse, sql: (m.content as QueryResponse).sql + data } } 
                   : m
               ))
+            } else if (event === 'sql_fix') {
+              // Self-healing: replace broken SQL with the corrected version
+              setMessages((prev) => prev.map(m => 
+                m.id === answerId 
+                  ? { ...m, content: { ...m.content as QueryResponse, sql: data } } 
+                  : m
+              ))
             } else if (event === 'final_result') {
               setMessages((prev) => prev.map(m => m.id === answerId ? { ...m, content: data } : m))
               onAnswer(data) // Trigger side-effects (modal, sidebar)

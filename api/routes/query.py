@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from agent.hitl_guard import check_sql
-from agent.sql_chain import _execute_sql, _extract_table_names, _log_query, run_query, stream_query
+from agent.sql_chain import _execute_sql, _extract_table_names, _log_query, stream_query
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["query"])
@@ -20,16 +20,6 @@ router = APIRouter(prefix="/api", tags=["query"])
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, description="Natural-language question to convert to SQL")
     history: list[dict[str, str]] = Field(default_factory=list, description="Previous turns: [{'question': str, 'sql': str}]")
-
-
-class QueryResponse(BaseModel):
-    sql: str
-    results: list[dict[str, Any]]
-    tables_used: list[str]
-    requires_approval: bool
-    approval_reason: str = ""
-    latency_ms: int
-    timing: dict[str, int] = Field(default_factory=dict)
 
 
 class ApproveRequest(BaseModel):
@@ -41,20 +31,6 @@ class ApproveResponse(BaseModel):
     executed: bool
     results: list[dict[str, Any]]
     message: str
-
-
-@router.post("/query", response_model=QueryResponse)
-async def query_endpoint(request: QueryRequest) -> QueryResponse:
-    """
-    Convert a natural-language question to SQL and execute it.
-    Write operations require explicit approval via /api/approve.
-    """
-    try:
-        result = await run_query(request.question, history=request.history)
-        return QueryResponse(**result)
-    except Exception as exc:
-        logger.error("Query endpoint error: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.post("/query/stream")
