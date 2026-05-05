@@ -126,4 +126,6 @@ class QueryLog(Base):
     latency_ms = Column(Integer, nullable=True)
     tables_used = Column(Text, nullable=True)  # comma-separated list
     error = Column(Text, nullable=True)
+    retry_count = Column(Integer, nullable=True, default=0)
+    success = Column(Boolean, nullable=True, default=True)
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.utcnow())

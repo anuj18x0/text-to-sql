@@ -55,28 +55,28 @@ async def health_check() -> dict[str, Any]:
         status["checks"]["chromadb"] = f"error: {exc}"
         status["status"] = "degraded"
 
-    # --- OpenAI check (key presence only, cached) ---
+    # --- Gemini check (key presence only, cached) ---
     now = time.monotonic()
     if _openai_check_cache.get("expires_at", 0) > now:
-        status["checks"]["openai"] = _openai_check_cache["result"]
+        status["checks"]["gemini"] = _openai_check_cache["result"]
         if _openai_check_cache.get("degraded"):
             status["status"] = "degraded"
     else:
         try:
-            api_key = os.getenv("OPENAI_API_KEY", "")
+            api_key = os.getenv("GEMINI_API_KEY", "")
             if not api_key:
-                raise ValueError("OPENAI_API_KEY not set")
-            openai_result = "ok (key present)"
+                raise ValueError("GEMINI_API_KEY not set")
+            gemini_result = "ok (key present)"
             degraded = False
         except Exception as exc:
-            openai_result = f"error: {exc}"
+            gemini_result = f"error: {exc}"
             degraded = True
 
-        status["checks"]["openai"] = openai_result
+        status["checks"]["gemini"] = gemini_result
         if degraded:
             status["status"] = "degraded"
 
-        _openai_check_cache["result"] = openai_result
+        _openai_check_cache["result"] = gemini_result
         _openai_check_cache["degraded"] = degraded
         _openai_check_cache["expires_at"] = now + _OPENAI_CACHE_TTL
 

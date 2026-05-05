@@ -10,12 +10,25 @@ export interface QueryResponse {
   approval_reason?: string
   latency_ms: number
   timing: Record<string, number>
+  retry_count?: number
   visualization?: {
     type: 'bar' | 'line' | 'pie' | 'none'
     x: string
     y: string
     title: string
   }
+  insight?: string
+  is_decomposed?: boolean
+  sub_query_count?: number
+}
+
+export interface AnalyticsData {
+  total_queries: number
+  success_rate: number
+  avg_latency_ms: number
+  avg_retry_count: number
+  top_tables: { table: string; count: number }[]
+  daily_queries: { date: string; count: number }[]
 }
 
 export interface ApproveResponse {
@@ -63,5 +76,10 @@ export async function getSchema(): Promise<SchemaTable[]> {
 
 export async function getHealth(): Promise<Record<string, unknown>> {
   const { data } = await api.get<Record<string, unknown>>('/api/health')
+  return data
+}
+
+export async function getAnalytics(): Promise<AnalyticsData> {
+  const { data } = await api.get<AnalyticsData>('/api/analytics')
   return data
 }

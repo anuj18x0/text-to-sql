@@ -37,6 +37,9 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from sqlalchemy import text
 
 from agent.hitl_guard import check_sql
+from agent.insight_engine import generate_insight
+from agent.intent import classify_intent
+from agent.memory import recall_similar, store_query, format_memory_examples
 from agent.retriever import get_relevant_schema
 from model.database import get_engine, get_session
 from model.schema import Base, QueryLog
@@ -94,9 +97,9 @@ Return valid JSON ONLY:
 }}"""
 
 async def _suggest_visualization(question: str, sql: str) -> dict[str, Any]:
-    """Uses LLM to suggest the best chart type for the given query."""
+    """Uses fast LLM to suggest the best chart type for the given query."""
     try:
-        llm = _get_llm(temperature=0)
+        llm = _get_fast_llm()
         prompt = ChatPromptTemplate.from_template(VISUALIZATION_PROMPT)
         chain = prompt | llm | StrOutputParser()
         
@@ -122,10 +125,26 @@ Question: {question}
 
 Expanded Query:"""
 
+# Secondary fast LLM for auxiliary tasks (expansion, visualization, insights)
+_llm_fast_instance: ChatGoogleGenerativeAI | None = None
+FAST_MODEL = "gemini-3.1-flash-lite-preview"
+
+def _get_fast_llm() -> ChatGoogleGenerativeAI:
+    """Return a cached fast LLM for auxiliary tasks (expansion, viz, insight)."""
+    global _llm_fast_instance
+    if _llm_fast_instance is None:
+        _llm_fast_instance = ChatGoogleGenerativeAI(
+            model=os.getenv("GEMINI_FAST_MODEL", FAST_MODEL),
+            temperature=0.3,
+            api_key=os.getenv("GEMINI_API_KEY", ""),
+        )
+    return _llm_fast_instance
+
+
 async def _expand_query(question: str, history: list[HumanMessage | AIMessage]) -> str:
-    """Uses LLM to turn conversational questions into descriptive search queries for RAG."""
+    """Uses fast LLM to turn conversational questions into descriptive search queries for RAG."""
     try:
-        llm = _get_llm(temperature=0)
+        llm = _get_fast_llm()
         prompt = ChatPromptTemplate.from_template(QUERY_EXPANSION_PROMPT)
         chain = prompt | llm | StrOutputParser()
         
@@ -142,163 +161,20 @@ async def stream_query(question: str, history: list[dict[str, str]] = []):
     """
     Async generator for real-time SQL streaming.
     Yields JSON-encoded chunks for Server-Sent Events (SSE).
+    
+    Delegates to the orchestrator pipeline which handles:
+    - Intent classification + query expansion (parallel)
+    - Memory recall + schema retrieval
+    - Query decomposition for complex questions
+    - SQL generation with streaming
+    - Self-healing retry loop
+    - Visualization + insight generation (parallel)
+    - Memory storage
     """
-    overall_start = time.monotonic()
+    from agent.orchestrator import orchestrate_query
     
-    # 1. Cache Check
-    history_str = str(history)
-    normalized_q = f"{question.strip().lower()}|{history_str}"
-    if normalized_q in _response_cache:
-        cached = _response_cache[normalized_q]
-        if time.monotonic() < cached["expires_at"]:
-            logger.info("Streaming cached response for: %s", normalized_q)
-            resp = cached["response"].copy()
-            resp["latency_ms"] = int((time.monotonic() - overall_start) * 1000)
-            resp["timing"] = {"retrieval_ms": 0, "llm_ms": 0, "execution_ms": 0}
-            yield f"data: {json.dumps({'event': 'final_result', 'data': resp}, default=json_serializable)}\n\n"
-            return
-    
-    timing = {"retrieval_ms": 0, "llm_ms": 0, "execution_ms": 0}
-    generated_sql_chunks = []
-    
-    try:
-        # --- QUERY EXPANSION (commented out for latency — saves ~3-4s) ---
-        # yield f"data: {json.dumps({'event': 'status', 'data': 'Interpreting question...'}, default=json_serializable)}\n\n"
-        # expansion_start = time.monotonic()
-        # formatted_history = []
-        # for turn in history:
-        #     formatted_history.append(HumanMessage(content=turn["question"]))
-        #     formatted_history.append(AIMessage(content=turn["sql"]))
-        # expanded_q = await _expand_query(question, formatted_history)
-        # --- END QUERY EXPANSION ---
-        
-        # 2. Retrieval (using raw question directly)
-        yield f"data: {json.dumps({'event': 'status', 'data': 'Analyzing database schema...'}, default=json_serializable)}\n\n"
-        retrieval_start = time.monotonic()
-        schema_context = get_relevant_schema(question, k=3)
-        timing["retrieval_ms"] = int((time.monotonic() - retrieval_start) * 1000)
-        
-        # 3. LLM Streaming
-        few_shot = _load_few_shot_examples()
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", SYSTEM_PROMPT),
-            MessagesPlaceholder(variable_name="history"),
-            ("human", USER_PROMPT),
-        ])
-        
-        formatted_history = []
-        for turn in history:
-            formatted_history.append(HumanMessage(content=turn["question"]))
-            formatted_history.append(AIMessage(content=turn["sql"]))
-            
-        llm = _get_llm()
-        chain = prompt | llm
-        
-        llm_start = time.monotonic()
-        first_chunk = True
-        
-        async for chunk in chain.astream({
-            "schema": schema_context,
-            "examples": few_shot,
-            "history": formatted_history,
-            "question": question,
-        }):
-            if first_chunk:
-                yield f"data: {json.dumps({'event': 'status', 'data': 'Generating SQL...'}, default=json_serializable)}\n\n"
-                first_chunk = False
-            
-            content = chunk.content
-            generated_sql_chunks.append(content)
-            yield f"data: {json.dumps({'event': 'sql_chunk', 'data': content}, default=json_serializable)}\n\n"
-            
-        timing["llm_ms"] = int((time.monotonic() - llm_start) * 1000)
-        
-        # 4. Finalize SQL and Check HITL
-        full_raw_sql = "".join(generated_sql_chunks)
-        generated_sql = _extract_sql(full_raw_sql)
-        tables_used = _extract_table_names(generated_sql)
-        
-        guard_result = check_sql(generated_sql)
-        current_latency = int((time.monotonic() - overall_start) * 1000)
-        
-        if guard_result["requires_approval"]:
-            final_resp = {
-                "sql": generated_sql,
-                "results": [],
-                "tables_used": tables_used,
-                "requires_approval": True,
-                "approval_reason": guard_result.get("reason", ""),
-                "latency_ms": current_latency,
-                "timing": timing
-            }
-            _log_query(question, generated_sql, current_latency, tables_used, error=None)
-            yield f"data: {json.dumps({'event': 'final_result', 'data': final_resp}, default=json_serializable)}\n\n"
-            return
-            
-        # 5. Execution with Self-Healing Retry Loop
-        yield f"data: {json.dumps({'event': 'status', 'data': 'Executing query...'}, default=json_serializable)}\n\n"
-        execution_start = time.monotonic()
-        
-        current_sql = generated_sql
-        last_error = None
-        results = None
-        
-        for attempt in range(1 + MAX_RETRIES):
-            try:
-                results = await asyncio.to_thread(_execute_sql, current_sql)
-                generated_sql = current_sql  # Update to the working version
-                break
-            except Exception as exec_err:
-                last_error = str(exec_err)
-                if attempt < MAX_RETRIES:
-                    logger.warning(
-                        "SQL execution failed (attempt %d/%d): %s",
-                        attempt + 1, MAX_RETRIES + 1, last_error
-                    )
-                    yield f"data: {json.dumps({'event': 'status', 'data': f'Fixing SQL (attempt {attempt + 2})...'}, default=json_serializable)}\n\n"
-                    
-                    # Ask Gemini to fix the broken SQL
-                    fixed_sql = await _fix_sql(question, current_sql, last_error, schema_context)
-                    logger.info("Self-healed SQL: %s", fixed_sql)
-                    
-                    # Stream the corrected SQL to frontend
-                    yield f"data: {json.dumps({'event': 'sql_fix', 'data': fixed_sql}, default=json_serializable)}\n\n"
-                    current_sql = fixed_sql
-                else:
-                    # All retries exhausted — raise the last error
-                    raise exec_err
-        
-        timing["execution_ms"] = int((time.monotonic() - execution_start) * 1000)
-        
-        overall_latency = int((time.monotonic() - overall_start) * 1000)
-        _log_query(question, generated_sql, overall_latency, tables_used, error=None)
-        
-        # --- VISUALIZATION SUGGESTION (commented out for latency — saves ~3-4s) ---
-        # viz_suggestion = await _suggest_visualization(question, generated_sql)
-        # --- END VISUALIZATION ---
-        
-        final_response = {
-            "sql": generated_sql,
-            "results": results,
-            "tables_used": tables_used,
-            "requires_approval": False,
-            "latency_ms": overall_latency,
-            "timing": timing,
-            # "visualization": viz_suggestion  # Re-enable when using Flash model
-        }
-        
-        # Save to Cache
-        _response_cache[normalized_q] = {
-            "response": final_response,
-            "expires_at": time.monotonic() + 3600
-        }
-        
-        yield f"data: {json.dumps({'event': 'final_result', 'data': final_response}, default=json_serializable)}\n\n"
-
-    except Exception as exc:
-        overall_latency = int((time.monotonic() - overall_start) * 1000)
-        logger.error("stream_query failed: %s", exc, exc_info=True)
-        yield f"data: {json.dumps({'event': 'error', 'data': str(exc)}, default=json_serializable)}\n\n"
+    async for event in orchestrate_query(question, history):
+        yield event
 
 SYSTEM_PROMPT = """You are an expert PostgreSQL analyst for the Olist Brazilian E-Commerce database.
 
@@ -313,6 +189,8 @@ Rules:
 6. For date operations, use PostgreSQL syntax (e.g., EXTRACT, AGE, or INTERVAL math). Avoid SQLite-specific functions like strftime.
 7. Limit results to 1000 rows unless the question asks for all rows.
 8. Never generate INSERT, UPDATE, DELETE, or DROP statements.
+
+{intent}
 
 --- RELEVANT SCHEMA ---
 {schema}
@@ -412,6 +290,8 @@ def _log_query(
     latency_ms: int,
     tables_used: list[str],
     error: str | None,
+    retry_count: int = 0,
+    success: bool = True,
 ) -> None:
     """Persist a query execution record to the query_log table."""
     try:
@@ -422,6 +302,8 @@ def _log_query(
                 latency_ms=latency_ms,
                 tables_used=",".join(tables_used),
                 error=error,
+                retry_count=retry_count,
+                success=success,
                 created_at=datetime.utcnow(),
             )
             session.add(log_entry)

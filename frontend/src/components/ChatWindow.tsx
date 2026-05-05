@@ -3,6 +3,7 @@ import { postQueryStream, type QueryResponse } from '../api'
 import SqlDisplay from './SqlDisplay'
 import ResultsTable from './ResultsTable'
 import ChartDisplay from './ChartDisplay'
+import InsightPanel from './InsightPanel'
 import SkeletonLoader from './SkeletonLoader'
 import type { Message } from '../App'
 
@@ -200,6 +201,15 @@ export default function ChatWindow({ messages, setMessages, onAnswer }: Props) {
 
                     {(msg.content as QueryResponse).results.length > 0 && (
                       <ResultsTable results={(msg.content as QueryResponse).results} />
+                    )}
+
+                    {(msg.content as QueryResponse).insight && (
+                      <InsightPanel
+                        insight={(msg.content as QueryResponse).insight!}
+                        isDecomposed={(msg.content as QueryResponse).is_decomposed}
+                        subQueryCount={(msg.content as QueryResponse).sub_query_count}
+                        retryCount={(msg.content as QueryResponse).retry_count}
+                      />
                     )}
                   </div>
                 )}
